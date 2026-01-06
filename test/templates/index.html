@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Othello (Replit)</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Othello</h1>
+      <div class="controls">
+        <button id="newGameBtn">新規ゲーム</button>
+        <span id="statusText">読み込み中...</span>
+      </div>
+      <div class="meta">
+        <div>黒: <span id="blackCount">2</span></div>
+        <div>白: <span id="whiteCount">2</span></div>
+        <div>手番: <span id="turnText">-</span></div>
+      </div>
+      <div id="message" class="message"></div>
+    </header>
+
+    <main>
+      <div id="board" class="board" aria-label="othello board"></div>
+
+      <section class="history">
+        <div class="historyHeader">
+          <h2>対戦履歴（直近50件）</h2>
+          <button id="refreshHistoryBtn">更新</button>
+        </div>
+        <div id="historyList" class="historyList"></div>
+      </section>
+    </main>
+
+    <footer>
+      <small>Server-side rules + SQLite match history</small>
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
