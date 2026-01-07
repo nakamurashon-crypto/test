@@ -1,370 +1,387 @@
 import os
 import sqlite3
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template
+from flask import Flask, request, jsonify, render_template_string
 
+# -----------------------------
+# App config
+# -----------------------------
 app = Flask(__name__)
-app.config["JSON_AS_ASCII"] = False
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "othello.db")
+# Cloud Run / local 共通
+PORT = int(os.environ.get("PORT", "8080"))
 
-DIRECTIONS = [
-    (-1, -1), (0, -1), (1, -1),
-    (-1,  0),          (1,  0),
-    (-1,  1), (0,  1), (1,  1),
-]
+# SQLite DB path
+# - Cloud Run: /tmp is writable (but not durable)
+# - Windows / local: use project directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-def get_db():
+default_db = os.path.join(BASE_DIR, "chat.db")
+if os.name != "nt":  # not Windows
+    default_db = "/tmp/chat.db"
+
+DB_PATH = os.environ.get("DB_PATH", default_db)
+# -----------------------------
+# DB helpers
+# -----------------------------
+def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
-    conn = get_db()
-    cur = conn.cursor()
+    # Ensure parent dir exists (for custom DB_PATH)
+    parent = os.path.dirname(DB_PATH)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS games (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        board TEXT NOT NULL,                 -- 64 chars (row-major), '.' 'B' 'W'
-        current_player TEXT NOT NULL,        -- 'B' or 'W'
-        status TEXT NOT NULL,                -- 'active' or 'finished'
-        winner TEXT,                         -- 'B' 'W' 'D' (draw) or NULL
-        black_count INTEGER NOT NULL,
-        white_count INTEGER NOT NULL
-    );
-    """)
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS moves (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        game_id INTEGER NOT NULL,
-        move_no INTEGER NOT NULL,
-        player TEXT NOT NULL,
-        x INTEGER,
-        y INTEGER,
-        flipped INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY(game_id) REFERENCES games(id)
-    );
-    """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS matches (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        game_id INTEGER NOT NULL UNIQUE,
-        played_at TEXT NOT NULL,
-        winner TEXT NOT NULL,
-        black_count INTEGER NOT NULL,
-        white_count INTEGER NOT NULL,
-        total_moves INTEGER NOT NULL,
-        FOREIGN KEY(game_id) REFERENCES games(id)
-    );
-    """)
+def add_message(session_id: str, role: str, content: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (session_id, role, content, datetime.utcnow().isoformat())
+        )
+        conn.commit()
 
-    conn.commit()
-    conn.close()
+def fetch_messages(session_id: str, limit: int = 50):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, session_id, role, content, created_at FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (session_id, limit)
+        ).fetchall()
+    return list(reversed(rows))
 
-def opponent(p: str) -> str:
-    return "W" if p == "B" else "B"
+def list_sessions(limit: int = 20):
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT session_id, MAX(created_at) AS last_time, COUNT(*) AS msg_count
+            FROM messages
+            GROUP BY session_id
+            ORDER BY last_time DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return rows
 
-def deserialize_board(s: str):
-    s = s.strip()
-    return [list(s[i*8:(i+1)*8]) for i in range(8)]
-
-def serialize_board(board):
-    return "".join("".join(row) for row in board)
-
-def count_discs(board):
-    b = sum(cell == "B" for row in board for cell in row)
-    w = sum(cell == "W" for row in board for cell in row)
-    return b, w
-
-def in_bounds(x, y):
-    return 0 <= x < 8 and 0 <= y < 8
-
-def flips_for_move(board, x, y, player):
-    if not in_bounds(x, y) or board[y][x] != ".":
-        return []
-    opp = opponent(player)
-    flips = []
-
-    for dx, dy in DIRECTIONS:
-        cx, cy = x + dx, y + dy
-        line = []
-        while in_bounds(cx, cy) and board[cy][cx] == opp:
-            line.append((cx, cy))
-            cx += dx
-            cy += dy
-        # line ends: must be player disc to bracket
-        if line and in_bounds(cx, cy) and board[cy][cx] == player:
-            flips.extend(line)
-
-    return flips
-
-def legal_moves(board, player):
-    moves = {}
-    for y in range(8):
-        for x in range(8):
-            fl = flips_for_move(board, x, y, player)
-            if fl:
-                moves[(x, y)] = fl
-    return moves
-
-def initial_board():
-    board = [["." for _ in range(8)] for _ in range(8)]
-    # standard start
-    board[3][3] = "W"
-    board[4][4] = "W"
-    board[3][4] = "B"
-    board[4][3] = "B"
-    return board
-
-def now_iso():
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-def ensure_turn_is_playable(board, current_player):
+# -----------------------------
+# Bot logic (rule-based)
+# -----------------------------
+def generate_reply(user_text: str, history_rows):
     """
-    If current player has no moves, try pass.
-    Returns (new_current_player, message)
+    history_rows: sqlite rows of past messages (role/content)
+    Replace this function later if you want to call an LLM.
     """
-    cur_moves = legal_moves(board, current_player)
-    if cur_moves:
-        return current_player, None
+    t = (user_text or "").strip()
+    t_low = t.lower()
 
-    opp = opponent(current_player)
-    opp_moves = legal_moves(board, opp)
-    if opp_moves:
-        return opp, f"{'黒' if current_player=='B' else '白'}は置ける場所がないためパス。次は{'黒' if opp=='B' else '白'}。"
+    # Simple intents
+    if not t:
+        return "何か入力してくれ。空だと反応できない。"
 
-    # nobody can move -> game ends
-    return current_player, "両者とも置ける場所がないため終了。"
+    if "help" in t_low or "使い方" in t or "ヘルプ" in t:
+        return (
+            "このボットはデモ用のチャットです。\n"
+            "・挨拶：こんにちは / hi\n"
+            "・時間：時間 / time\n"
+            "・要約：要約: <文章>\n"
+            "・反射：それ以外は、内容を短く言い換えて返します。"
+        )
 
-def finish_game_if_needed(conn, game_id, board):
-    """
-    If game ended, update games, insert matches.
-    Returns (status, winner, message or None)
-    """
-    b, w = count_discs(board)
+    if "こんにちは" in t or "hi" in t_low or "hello" in t_low:
+        return "こんにちは。今日は何を作る？ 目的（Why）から一緒に決めよう。"
 
-    # end condition: no legal moves for both
-    if legal_moves(board, "B") or legal_moves(board, "W"):
-        return "active", None, None
+    if "時間" in t or "time" in t_low:
+        return f"UTC時刻は {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} です。"
 
-    if b > w:
-        winner = "B"
-    elif w > b:
-        winner = "W"
-    else:
-        winner = "D"
+    if t.startswith("要約:") or t.startswith("要約："):
+        body = t.split(":", 1)[1].strip() if ":" in t else t.split("：", 1)[1].strip()
+        if not body:
+            return "要約したい文章を `要約: ...` の形で入れて。"
+        # naive summary (first ~200 chars)
+        short = body.replace("\n", " ").strip()
+        if len(short) > 220:
+            short = short[:220] + "…"
+        return f"要約（雑）：{short}"
 
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE games
-        SET status='finished', winner=?, updated_at=?, black_count=?, white_count=?
-        WHERE id=?
-    """, (winner, now_iso(), b, w, game_id))
+    # Use last user message as context hint
+    last_user = None
+    for r in reversed(history_rows):
+        if r["role"] == "user":
+            last_user = r["content"]
+            break
 
-    # total moves
-    cur.execute("SELECT COUNT(*) AS c FROM moves WHERE game_id=?", (game_id,))
-    total_moves = cur.fetchone()["c"]
+    if last_user:
+        return (
+            "了解。いまの発言を噛み砕いて返す。\n"
+            f"あなた：{t}\n\n"
+            "質問：それは何のため？（Why1）\n"
+            "→ 目的が分かると、実装の最短手が確定する。"
+        )
 
-    # insert match if not exists
-    cur.execute("""
-        INSERT OR IGNORE INTO matches(game_id, played_at, winner, black_count, white_count, total_moves)
-        VALUES(?, ?, ?, ?, ?, ?)
-    """, (game_id, now_iso(), winner, b, w, total_moves))
+    # default
+    return (
+        "受け取った。要点を確認する。\n"
+        f"あなた：{t}\n\n"
+        "まず1つだけ聞く。\n"
+        "それ、何のため？（Why1）"
+    )
 
-    conn.commit()
+# -----------------------------
+# Web UI (single file template)
+# -----------------------------
+INDEX_HTML = """
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Flask Chatbot Demo</title>
+  <style>
+    body{font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#0b0f19; color:#e8eefc; margin:0;}
+    .wrap{max-width:900px; margin:0 auto; padding:24px;}
+    .card{background:#121a2a; border:1px solid #22304b; border-radius:12px; padding:16px;}
+    .row{display:flex; gap:12px; flex-wrap:wrap;}
+    input,button,textarea{font:inherit;}
+    .top{display:flex; justify-content:space-between; align-items:center; gap:12px;}
+    .tag{font-size:12px; opacity:.8;}
+    .chat{height:420px; overflow:auto; padding:12px; background:#0f1626; border-radius:10px; border:1px solid #22304b;}
+    .msg{margin:10px 0; display:flex;}
+    .bubble{max-width:78%; padding:10px 12px; border-radius:12px; line-height:1.4; white-space:pre-wrap;}
+    .user{justify-content:flex-end;}
+    .user .bubble{background:#2b5cff; color:white;}
+    .assistant .bubble{background:#1a2640;}
+    .controls{display:flex; gap:8px; margin-top:12px;}
+    .controls input{flex:1; padding:10px 12px; border-radius:10px; border:1px solid #22304b; background:#0f1626; color:#e8eefc;}
+    .controls button{padding:10px 12px; border-radius:10px; border:1px solid #22304b; background:#1a2640; color:#e8eefc; cursor:pointer;}
+    .controls button:hover{filter:brightness(1.1);}
+    .side{min-width:260px; flex:1;}
+    .main{flex:2; min-width:320px;}
+    a{color:#9cc0ff;}
+    .sessions{max-height:420px; overflow:auto; padding:10px; background:#0f1626; border:1px solid #22304b; border-radius:10px;}
+    .sess{display:block; padding:10px; border-radius:10px; text-decoration:none; color:#e8eefc;}
+    .sess:hover{background:#17233b;}
+    .muted{opacity:.7; font-size:12px;}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <h2 style="margin:0;">Flask Chatbot Demo</h2>
+      <div class="tag">session: <b id="sid"></b></div>
+    </div>
 
-    msg = f"ゲーム終了：黒 {b} / 白 {w}。勝者：{'黒' if winner=='B' else '白' if winner=='W' else '引き分け'}"
-    return "finished", winner, msg
+    <div class="row" style="margin-top:16px;">
+      <div class="side">
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <b>セッション履歴</b>
+            <button onclick="newSession()" style="padding:6px 10px;">新規</button>
+          </div>
+          <div class="muted" style="margin-top:6px;">クリックで切替。DBに保存されています。</div>
+          <div class="sessions" id="sessions" style="margin-top:10px;"></div>
+        </div>
+      </div>
 
-def game_state_payload(conn, game_row, extra_message=None):
-    board = deserialize_board(game_row["board"])
-    current_player = game_row["current_player"]
-    status = game_row["status"]
-    winner = game_row["winner"]
+      <div class="main">
+        <div class="card">
+          <div class="chat" id="chat"></div>
+          <div class="controls">
+            <input id="text" placeholder="メッセージを入力（例：こんにちは / 時間 / 要約: ...）" />
+            <button onclick="sendMsg()">送信</button>
+          </div>
+          <div class="muted" style="margin-top:10px;">
+            API: <code>/api/chat</code> / 履歴: <code>/api/history?session_id=...</code>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 
-    # If active, handle pass logic at "state fetch" time too
-    message = extra_message
-    if status == "active":
-        new_cp, pass_msg = ensure_turn_is_playable(board, current_player)
-        if new_cp != current_player:
-            # update current player if pass
-            cur = conn.cursor()
-            cur.execute("""
-                UPDATE games SET current_player=?, updated_at=? WHERE id=?
-            """, (new_cp, now_iso(), game_row["id"]))
-            conn.commit()
-            current_player = new_cp
-            message = pass_msg if pass_msg else message
+<script>
+  function genId(){
+    return "s_" + Math.random().toString(36).slice(2) + "_" + Date.now().toString(36);
+  }
 
-        # check finish
-        status2, winner2, fin_msg = finish_game_if_needed(conn, game_row["id"], board)
-        if status2 == "finished":
-            status, winner = status2, winner2
-            message = fin_msg if fin_msg else message
-
-    b, w = count_discs(board)
-    moves = legal_moves(board, current_player) if status == "active" else {}
-    legal_list = [{"x": x, "y": y} for (x, y) in moves.keys()]
-
-    return {
-        "game_id": game_row["id"],
-        "board": board,  # 2D
-        "current_player": current_player,
-        "status": status,
-        "winner": winner,  # 'B' 'W' 'D' or None
-        "black_count": b,
-        "white_count": w,
-        "legal_moves": legal_list,
-        "message": message,
+  function getSid(){
+    const url = new URL(location.href);
+    let sid = url.searchParams.get("session_id");
+    if(!sid){
+      sid = localStorage.getItem("session_id") || genId();
+      url.searchParams.set("session_id", sid);
+      history.replaceState(null, "", url.toString());
     }
+    localStorage.setItem("session_id", sid);
+    document.getElementById("sid").textContent = sid;
+    return sid;
+  }
 
-@app.route("/")
+  async function loadSessions(){
+    const res = await fetch("/api/sessions");
+    const data = await res.json();
+    const box = document.getElementById("sessions");
+    box.innerHTML = "";
+    const current = getSid();
+
+    data.sessions.forEach(s => {
+      const a = document.createElement("a");
+      a.className = "sess";
+      a.href = "?session_id=" + encodeURIComponent(s.session_id);
+      a.innerHTML = "<div><b>" + s.session_id + "</b></div>" +
+                    "<div class='muted'>last: " + s.last_time + " / msgs: " + s.msg_count + "</div>";
+      if(s.session_id === current){
+        a.style.background = "#17233b";
+      }
+      box.appendChild(a);
+    });
+  }
+
+  function renderChat(items){
+    const chat = document.getElementById("chat");
+    chat.innerHTML = "";
+    items.forEach(m => {
+      const div = document.createElement("div");
+      div.className = "msg " + (m.role === "user" ? "user" : "assistant");
+      const b = document.createElement("div");
+      b.className = "bubble";
+      b.textContent = m.content;
+      div.appendChild(b);
+      chat.appendChild(div);
+    });
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  async function loadHistory(){
+    const sid = getSid();
+    const res = await fetch("/api/history?session_id=" + encodeURIComponent(sid));
+    const data = await res.json();
+    renderChat(data.messages);
+  }
+
+  async function sendMsg(){
+    const sid = getSid();
+    const inp = document.getElementById("text");
+    const text = inp.value;
+    if(!text.trim()) return;
+    inp.value = "";
+
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({session_id: sid, message: text})
+    });
+    const data = await res.json();
+    await loadHistory();
+    await loadSessions();
+  }
+
+  function newSession(){
+    const sid = genId();
+    const url = new URL(location.href);
+    url.searchParams.set("session_id", sid);
+    location.href = url.toString();
+  }
+
+  // enter to send
+  document.addEventListener("keydown", (e) => {
+    if(e.key === "Enter" && (document.activeElement && document.activeElement.id === "text")){
+      sendMsg();
+    }
+  });
+
+  (async function init(){
+    getSid();
+    await loadSessions();
+    await loadHistory();
+  })();
+</script>
+</body>
+</html>
+"""
+
+# -----------------------------
+# Routes
+# -----------------------------
+
+@app.get("/")
 def index():
-    return render_template("index.html")
+    return render_template_string(INDEX_HTML)
 
-@app.route("/api/new", methods=["POST"])
-def api_new():
-    board = initial_board()
-    b, w = count_discs(board)
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO games(created_at, updated_at, board, current_player, status, winner, black_count, white_count)
-        VALUES(?, ?, ?, 'B', 'active', NULL, ?, ?)
-    """, (now_iso(), now_iso(), serialize_board(board), b, w))
-    game_id = cur.lastrowid
+@app.get("/healthz")
+def healthz():
+    return "ok", 200
 
-    conn.commit()
+@app.get("/api/sessions")
+def api_sessions():
+    init_db()
+    sessions = list_sessions(limit=50)
+    return jsonify({
+        "sessions": [
+            {
+                "session_id": r["session_id"],
+                "last_time": r["last_time"],
+                "msg_count": r["msg_count"]
+            } for r in sessions
+        ]
+    })
 
-    cur.execute("SELECT * FROM games WHERE id=?", (game_id,))
-    row = cur.fetchone()
-    payload = game_state_payload(conn, row, extra_message="新規ゲーム開始：黒の番です。")
-    conn.close()
-    return jsonify(payload)
-
-@app.route("/api/state/<int:game_id>", methods=["GET"])
-def api_state(game_id: int):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM games WHERE id=?", (game_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return jsonify({"error": "game not found"}), 404
-
-    payload = game_state_payload(conn, row)
-    conn.close()
-    return jsonify(payload)
-
-@app.route("/api/move", methods=["POST"])
-def api_move():
-    data = request.get_json(force=True)
-    game_id = int(data.get("game_id"))
-    x = data.get("x")
-    y = data.get("y")
-
-    if x is None or y is None:
-        return jsonify({"error": "x,y required"}), 400
-
-    x = int(x)
-    y = int(y)
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM games WHERE id=?", (game_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return jsonify({"error": "game not found"}), 404
-
-    if row["status"] != "active":
-        payload = game_state_payload(conn, row, extra_message="このゲームは既に終了しています。")
-        conn.close()
-        return jsonify(payload)
-
-    board = deserialize_board(row["board"])
-    player = row["current_player"]
-
-    fl = flips_for_move(board, x, y, player)
-    if not fl:
-        payload = game_state_payload(conn, row, extra_message="そこには置けません（合法手ではありません）。")
-        conn.close()
-        return jsonify(payload), 400
-
-    # apply move
-    board[y][x] = player
-    for fx, fy in fl:
-        board[fy][fx] = player
-
-    b, w = count_discs(board)
-
-    # move_no
-    cur.execute("SELECT COUNT(*) AS c FROM moves WHERE game_id=?", (game_id,))
-    move_no = cur.fetchone()["c"] + 1
-
-    cur.execute("""
-        INSERT INTO moves(game_id, move_no, player, x, y, flipped, created_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?)
-    """, (game_id, move_no, player, x, y, len(fl), now_iso()))
-
-    # decide next player (pass rules included later in game_state_payload)
-    next_player = opponent(player)
-
-    cur.execute("""
-        UPDATE games
-        SET board=?, current_player=?, updated_at=?, black_count=?, white_count=?
-        WHERE id=?
-    """, (serialize_board(board), next_player, now_iso(), b, w, game_id))
-
-    conn.commit()
-
-    # reload row
-    cur.execute("SELECT * FROM games WHERE id=?", (game_id,))
-    row2 = cur.fetchone()
-
-    payload = game_state_payload(conn, row2, extra_message=None)
-    conn.close()
-    return jsonify(payload)
-
-@app.route("/api/history", methods=["GET"])
+@app.get("/api/history")
 def api_history():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT m.game_id, m.played_at, m.winner, m.black_count, m.white_count, m.total_moves
-        FROM matches m
-        ORDER BY m.played_at DESC
-        LIMIT 50
-    """)
-    rows = cur.fetchall()
-    conn.close()
+    init_db()
+    session_id = request.args.get("session_id", "").strip()
+    if not session_id:
+        return jsonify({"error": "session_id is required"}), 400
+    rows = fetch_messages(session_id, limit=200)
+    return jsonify({
+        "session_id": session_id,
+        "messages": [
+            {
+                "id": r["id"],
+                "role": r["role"],
+                "content": r["content"],
+                "created_at": r["created_at"]
+            } for r in rows
+        ]
+    })
 
-    def win_label(w):
-        if w == "B":
-            return "黒"
-        if w == "W":
-            return "白"
-        return "引き分け"
+@app.post("/api/chat")
+def api_chat():
+    init_db()
+    data = request.get_json(silent=True) or {}
+    session_id = (data.get("session_id") or "").strip()
+    message = (data.get("message") or "").strip()
 
-    history = []
-    for r in rows:
-        history.append({
-            "game_id": r["game_id"],
-            "played_at": r["played_at"],
-            "winner": win_label(r["winner"]),
-            "black_count": r["black_count"],
-            "white_count": r["white_count"],
-            "total_moves": r["total_moves"],
-        })
-    return jsonify({"history": history})
+    if not session_id:
+        return jsonify({"error": "session_id is required"}), 400
+    if not message:
+        return jsonify({"error": "message is required"}), 400
 
+    # Store user message
+    add_message(session_id, "user", message)
+
+    # Generate reply using history
+    history = fetch_messages(session_id, limit=50)
+    reply = generate_reply(message, history)
+
+    # Store assistant message
+    add_message(session_id, "assistant", reply)
+
+    return jsonify({"ok": True, "reply": reply})
+
+# -----------------------------
+# Entry
+# -----------------------------
 if __name__ == "__main__":
     init_db()
-    port = int(os.environ.get("PORT", "3000"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=PORT, debug=True)
